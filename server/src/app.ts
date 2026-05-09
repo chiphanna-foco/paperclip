@@ -29,13 +29,13 @@ import { userProfileRoutes } from "./routes/user-profiles.js";
 import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
 import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
+import { authRoutes } from "./routes/auth.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
 import {
   instanceDatabaseBackupRoutes,
   type InstanceDatabaseBackupService,
 } from "./routes/instance-database-backups.js";
 import { llmRoutes } from "./routes/llms.js";
-import { authRoutes } from "./routes/auth.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
@@ -58,7 +58,6 @@ import { createPluginHostServiceCleanup } from "./services/plugin-host-service-c
 import { pluginRegistryService } from "./services/plugin-registry.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
-import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -110,6 +109,7 @@ export async function createApp(
   opts: {
     uiMode: UiMode;
     serverPort: number;
+    publicBaseUrl?: string;
     storageService: StorageService;
     feedbackExportService?: {
       flushPendingFeedbackTraces(input?: {
@@ -144,6 +144,11 @@ export async function createApp(
       (req as unknown as { rawBody: Buffer }).rawBody = buf;
     },
   }));
+  // Prevent Cloudflare and other proxies from caching any response
+  app.use((_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store");
+    next();
+  });
   app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
@@ -168,7 +173,7 @@ export async function createApp(
   );
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
-    app.all("/api/auth/{*authPath}", opts.betterAuthHandler);
+    app.all("/api/auth/*authPath", opts.betterAuthHandler);
   }
   app.use(llmRoutes(db));
 
@@ -236,7 +241,6 @@ export async function createApp(
     jobStore,
   });
   const hostServiceCleanup = createPluginHostServiceCleanup(lifecycle, hostServicesDisposers);
-  let viteHtmlRenderer: ReturnType<typeof createCachedViteHtmlRenderer> | null = null;
   const loader = pluginLoader(
     db,
     {
@@ -308,46 +312,14 @@ export async function createApp(
     const uiDist = candidates.find((p) => fs.existsSync(path.join(p, "index.html")));
     if (uiDist) {
       const indexHtml = applyUiBranding(fs.readFileSync(path.join(uiDist, "index.html"), "utf-8"));
-      // Hashed asset files (Vite emits them under /assets/<name>.<hash>.<ext>)
-      // never change once built, so they can be cached aggressively.
-      app.use(
-        "/assets",
-        express.static(path.join(uiDist, "assets"), {
-          maxAge: "1y",
-          immutable: true,
-        }),
-      );
-      // Non-hashed static files (favicon.ico, manifest, robots.txt, etc.):
-      // short cache so operators who swap them out see the new version
-      // reasonably fast. Override for `index.html` specifically — it is
-      // served by this middleware for `/` and `/index.html`, and it must
-      // never outlive the asset hashes it points at.
-      app.use(
-        express.static(uiDist, {
-          maxAge: "1h",
-          setHeaders(res, filePath) {
-            if (path.basename(filePath) === "index.html") {
-              res.set("Cache-Control", "no-cache");
-            }
-          },
-        }),
-      );
-      // SPA fallback. Only for non-asset routes — if the browser asks for
-      // /assets/something.js that doesn't exist, we must NOT serve the HTML
-      // shell: the browser would try to load it as a JavaScript module, fail
-      // with a MIME-type error, and cache that broken response. Return 404
-      // instead. The index.html response itself is no-cache so a subsequent
-      // deploy's updated asset hashes are picked up on next load.
-      app.get(/.*/, (req, res) => {
-        if (req.path.startsWith("/assets/")) {
-          res.status(404).end();
-          return;
-        }
-        res
-          .status(200)
-          .set("Content-Type", "text/html")
-          .set("Cache-Control", "no-cache")
-          .end(indexHtml);
+      // Prevent Cloudflare/proxies from caching assets with stale 404s
+      app.use(express.static(uiDist, {
+        setHeaders: (res) => {
+          res.setHeader("Cache-Control", "no-store");
+        },
+      }));
+      app.get(/.*/, (_req, res) => {
+        res.status(200).set({ "Content-Type": "text/html", "Cache-Control": "no-store" }).end(indexHtml);
       });
     } else {
       console.warn("[paperclip] UI dist not found; running in API-only mode");
@@ -356,7 +328,6 @@ export async function createApp(
 
   if (opts.uiMode === "vite-dev") {
     const uiRoot = path.resolve(__dirname, "../../ui");
-    const publicUiRoot = path.resolve(uiRoot, "public");
     const hmrPort = resolveViteHmrPort(opts.serverPort);
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
@@ -367,34 +338,27 @@ export async function createApp(
         hmr: {
           host: opts.bindHost,
           port: hmrPort,
-          clientPort: hmrPort,
+          // When behind a reverse proxy/tunnel, the browser must reach HMR via the public host
+          clientPort: opts.publicBaseUrl ? 443 : hmrPort,
+          ...(opts.publicBaseUrl
+            ? { path: "/__vite_hmr" }
+            : {}),
         },
         allowedHosts: privateHostnameGateEnabled ? Array.from(privateHostnameAllowSet) : undefined,
       },
     });
-    viteHtmlRenderer = createCachedViteHtmlRenderer({
-      vite,
-      uiRoot,
-      brandHtml: applyUiBranding,
-    });
-    const renderViteHtml = viteHtmlRenderer;
 
-    if (fs.existsSync(publicUiRoot)) {
-      app.use(express.static(publicUiRoot, { index: false }));
-    }
+    app.use(vite.middlewares);
     app.get(/.*/, async (req, res, next) => {
-      if (!shouldServeViteDevHtml(req)) {
-        next();
-        return;
-      }
       try {
-        const html = await renderViteHtml.render(req.originalUrl);
+        const templatePath = path.resolve(uiRoot, "index.html");
+        const template = fs.readFileSync(templatePath, "utf-8");
+        const html = applyUiBranding(await vite.transformIndexHtml(req.originalUrl, template));
         res.status(200).set({ "Content-Type": "text/html" }).end(html);
       } catch (err) {
         next(err);
       }
     });
-    app.use(vite.middlewares);
   }
 
   app.use(errorHandler);
@@ -436,7 +400,6 @@ export async function createApp(
   process.once("exit", () => {
     if (feedbackExportTimer) clearInterval(feedbackExportTimer);
     devWatcher?.close();
-    viteHtmlRenderer?.dispose();
     hostServiceCleanup.disposeAll();
     hostServiceCleanup.teardown();
   });

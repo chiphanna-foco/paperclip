@@ -23,6 +23,7 @@ import {
   activityLog,
   companySkills as companySkillsTable,
   documentRevisions,
+  goals,
   issueDocuments,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -30,6 +31,7 @@ import {
   issueRelations,
   issues,
   issueWorkProducts,
+  projectGoals as projectGoalsTable,
   projects,
   projectWorkspaces,
   workspaceOperations,
@@ -1602,6 +1604,9 @@ async function buildPaperclipWakePayload(input: {
         title: string;
         status: string;
         priority: string;
+        description?: string | null;
+        goalId?: string | null;
+        projectId?: string | null;
       }
     | null;
 }) {
@@ -1617,13 +1622,49 @@ async function buildPaperclipWakePayload(input: {
             id: issues.id,
             identifier: issues.identifier,
             title: issues.title,
+            description: issues.description,
             status: issues.status,
             priority: issues.priority,
+            goalId: issues.goalId,
+            projectId: issues.projectId,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
+
+  // Fetch linked goal + any project-level goals so agents see the "why"
+  // behind the task, not just the task itself.
+  let issueGoal: { id: string; title: string; description: string | null; level: string } | null = null;
+  if (issueSummary?.goalId) {
+    issueGoal = await input.db
+      .select({
+        id: goals.id,
+        title: goals.title,
+        description: goals.description,
+        level: goals.level,
+      })
+      .from(goals)
+      .where(and(eq(goals.id, issueSummary.goalId), eq(goals.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+  }
+  let projectGoals: Array<{ id: string; title: string; description: string | null; level: string }> = [];
+  if (!issueGoal && issueSummary?.projectId) {
+    projectGoals = await input.db
+      .select({
+        id: goals.id,
+        title: goals.title,
+        description: goals.description,
+        level: goals.level,
+      })
+      .from(goals)
+      .innerJoin(projectGoalsTable, eq(projectGoalsTable.goalId, goals.id))
+      .where(and(
+        eq(projectGoalsTable.projectId, issueSummary.projectId),
+        eq(goals.companyId, input.companyId),
+      ))
+      .limit(3);
+  }
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -1697,8 +1738,10 @@ async function buildPaperclipWakePayload(input: {
           id: issueSummary.id,
           identifier: issueSummary.identifier,
           title: issueSummary.title,
+          description: issueSummary.description,
           status: issueSummary.status,
           priority: issueSummary.priority,
+          goalId: issueSummary.goalId,
         }
       : null,
     childIssueSummaries: Array.isArray(input.contextSnapshot.childIssueSummaries)
@@ -1718,6 +1761,8 @@ async function buildPaperclipWakePayload(input: {
           instruction: readNonEmptyString(input.contextSnapshot.livenessContinuationInstruction),
         }
       : null,
+    goal: issueGoal,
+    projectGoals,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
@@ -5670,6 +5715,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
           : null;
+
+      // Legacy ACTION-block processing removed (2026-04-19). Agents on
+      // codex_local now call the $paperclip skill directly instead of
+      // embedding fenced `action:<type>` blocks in their prose output.
 
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {

@@ -1,0 +1,558 @@
+diff --git a/dist/server/execute.js b/dist/server/execute.js
+index 93cddf8243271f5fb3ab101617f9114257e41328..df45891594125aeb3ef0578eacb0c965fa687c1e 100644
+--- a/dist/server/execute.js
++++ b/dist/server/execute.js
+@@ -1,22 +1,16 @@
+ /**
+  * Server-side execution logic for the Hermes Agent adapter.
+  *
+- * Spawns `hermes chat -q "..." -Q` as a child process, streams output,
+- * and returns structured results to Paperclip.
++ * Posts directly to ClawRouter (OpenAI-compatible proxy on localhost:8402)
++ * instead of spawning Hermes CLI. ClawRouter handles model routing,
++ * fallback chains, and circuit breaking.
+  *
+- * Verified CLI flags (hermes chat):
+- *   -q/--query         single query (non-interactive)
+- *   -Q/--quiet         quiet mode (no banner/spinner, only response + session_id)
+- *   -m/--model         model name (e.g. anthropic/claude-sonnet-4)
+- *   -t/--toolsets      comma-separated toolsets to enable
+- *   --provider         inference provider (auto, openrouter, nous, etc.)
+- *   -r/--resume        resume session by ID
+- *   -w/--worktree      isolated git worktree
+- *   -v/--verbose       verbose output
+- *   --checkpoints      filesystem checkpoints
++ * The adapter still builds the full Paperclip prompt with board data
++ * injection and anti-hallucination guardrails.
+  */
+-import { runChildProcess, buildPaperclipEnv, renderTemplate, ensureAbsoluteDirectory, } from "@paperclipai/adapter-utils/server-utils";
+-import { HERMES_CLI, DEFAULT_TIMEOUT_SEC, DEFAULT_GRACE_SEC, VALID_PROVIDERS, } from "../shared/constants.js";
++import http from "node:http";
++import { buildPaperclipEnv, renderTemplate, ensureAbsoluteDirectory, } from "@paperclipai/adapter-utils/server-utils";
++import { DEFAULT_TIMEOUT_SEC, DEFAULT_GRACE_SEC, } from "../shared/constants.js";
+ // ---------------------------------------------------------------------------
+ // Config helpers
+ // ---------------------------------------------------------------------------
+@@ -58,18 +52,18 @@ Title: {{taskTitle}}
+ 
+ 1. Work on the task using your tools
+ 2. When done, mark the issue as completed:
+-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Content-Type: application/json" -d '{"status":"done"}'\`
++   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/{{taskId}}" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" -H "Content-Type: application/json" -d '{"status":"done"}'\`
+ 3. Post a completion comment on the issue summarizing what you did:
+-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
++   \`curl -s -X POST "{{paperclipApiUrl}}/issues/{{taskId}}/comments" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" -H "Content-Type: application/json" -d '{"body":"DONE: <your summary here>"}'\`
+ 4. If this issue has a parent (check the issue body or comments for references like TRA-XX), post a brief notification on the parent issue so the parent owner knows:
+-   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
++   \`curl -s -X POST "{{paperclipApiUrl}}/issues/PARENT_ISSUE_ID/comments" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" -H "Content-Type: application/json" -d '{"body":"{{agentName}} completed {{taskId}}. Summary: <brief>"}'\`
+ {{/taskId}}
+ 
+ {{#commentId}}
+ ## Comment on This Issue
+ 
+ Someone commented. Read it:
+-   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" | python3 -m json.tool\`
++   \`curl -s "{{paperclipApiUrl}}/issues/{{taskId}}/comments/{{commentId}}" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" | python3 -m json.tool\`
+ 
+ Address the comment, POST a reply if needed, then continue working.
+ {{/commentId}}
+@@ -77,31 +71,68 @@ Address the comment, POST a reply if needed, then continue working.
+ {{#noTask}}
+ ## Heartbeat Wake — Check for Work
+ 
++CRITICAL: Only work on issues listed below. NEVER fabricate, hallucinate, or invent issue IDs or titles.
++If no issues are listed below, you MUST run the curl commands to fetch them from the API.
++Do NOT guess or make up issues from memory, context files, or previous sessions.
++
++{{#boardData}}
++### Current Company Issue Board (pre-fetched — authoritative source of truth)
++{{boardData}}
++
++Pick the highest priority open issue from the board above and work on it.
++- Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY"\`
++- Do the work in the project directory: {{projectName}}
++- When done, mark complete and post a comment (see Workflow steps 2-4 above)
++{{/boardData}}
++
++{{#noBoardData}}
+ 1. List ALL open issues assigned to you (todo, backlog, in_progress):
+-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"status\"]:>12} {i[\"priority\"]:>6} {i[\"title\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
++   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?assigneeAgentId={{agentId}}" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\\"identifier\\"]} {i[\\"status\\"]:>12} {i[\\"priority\\"]:>6} {i[\\"title\\"]}') for i in issues if i['status'] not in ('done','cancelled')]" \`
+ 
+ 2. If issues found, pick the highest priority one that is not done/cancelled and work on it:
+-   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID"\`
++   - Read the issue details: \`curl -s "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY"\`
+    - Do the work in the project directory: {{projectName}}
+    - When done, mark complete and post a comment (see Workflow steps 2-4 above)
+ 
+ 3. If no issues assigned to you, check for unassigned issues:
+-   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\"identifier\"]} {i[\"title\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
++   \`curl -s "{{paperclipApiUrl}}/companies/{{companyId}}/issues?status=backlog" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" | python3 -c "import sys,json;issues=json.loads(sys.stdin.read());[print(f'{i[\\"identifier\\"]} {i[\\"title\\"]}') for i in issues if not i.get('assigneeAgentId')]" \`
+    If you find a relevant issue, assign it to yourself:
+-   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
++   \`curl -s -X PATCH "{{paperclipApiUrl}}/issues/ISSUE_ID" -H "Authorization: Bearer $PAPERCLIP_AGENT_KEY" -H "Content-Type: application/json" -d '{"assigneeAgentId":"{{agentId}}","status":"todo"}'\`
+ 
+ 4. If truly nothing to do, report briefly what you checked.
++{{/noBoardData}}
+ {{/noTask}}`;
+ function buildPrompt(ctx, config) {
+     const template = cfgString(config.promptTemplate) || DEFAULT_PROMPT_TEMPLATE;
+-    const taskId = cfgString(ctx.config?.taskId);
+-    const taskTitle = cfgString(ctx.config?.taskTitle) || "";
+-    const taskBody = cfgString(ctx.config?.taskBody) || "";
+-    const commentId = cfgString(ctx.config?.commentId) || "";
+-    const wakeReason = cfgString(ctx.config?.wakeReason) || "";
++    // Paperclip stores wake context in ctx.context.paperclipWake. Read it directly
++    // since ctx.config doesn't actually get populated with task info by Paperclip.
++    const wake = ctx.context?.paperclipWake || {};
++    const wakeIssue = wake.issue || {};
++    const wakeComments = Array.isArray(wake.comments) ? wake.comments : [];
++    const latestComment = wakeComments.length > 0 ? wakeComments[wakeComments.length - 1] : null;
++    const contextTaskId = ctx.context?.taskId || ctx.context?.issueId || null;
++
++    const taskId = cfgString(ctx.config?.taskId) || wakeIssue.id || contextTaskId || "";
++    const taskTitle = cfgString(ctx.config?.taskTitle) || wakeIssue.title || "";
++    const taskIdentifier = cfgString(ctx.config?.taskIdentifier) || wakeIssue.identifier || "";
++    const taskBody = cfgString(ctx.config?.taskBody) || wakeIssue.description || "";
++    const commentId = cfgString(ctx.config?.commentId) || wake.latestCommentId || "";
++    const commentBody = cfgString(ctx.config?.commentBody) || latestComment?.body || "";
++    const commentAuthor = latestComment?.author?.type === "user" ? "a board member"
++        : latestComment?.author?.type === "agent" ? "another agent"
++        : latestComment ? "someone" : "";
++    const wakeReason = cfgString(ctx.config?.wakeReason) || wake.reason || "";
+     const agentName = ctx.agent?.name || "Hermes Agent";
+     const companyName = cfgString(ctx.config?.companyName) || "";
+     const projectName = cfgString(ctx.config?.projectName) || "";
++
++    // Format all visible comments as a thread (most recent last). Agents use this
++    // to understand conversation context when a user asks a follow-up question.
++    const commentThread = wakeComments.map((c) => {
++        const who = c.author?.type === "user" ? "Board" : c.author?.type === "agent" ? "Agent" : "System";
++        return `[${who}]: ${c.body}`;
++    }).join("\n\n");
++
+     // Build API URL — ensure it has the /api path
+     let paperclipApiUrl = cfgString(config.paperclipApiUrl) ||
+         process.env.PAPERCLIP_API_URL ||
+@@ -118,12 +149,25 @@ function buildPrompt(ctx, config) {
+         runId: ctx.runId || "",
+         taskId: taskId || "",
+         taskTitle,
++        taskIdentifier,
+         taskBody,
+         commentId,
++        commentBody,
++        commentAuthor,
++        commentThread,
+         wakeReason,
+         projectName,
+         paperclipApiUrl,
+     };
++    // Build board data from pre-fetched context
++    const boardIssues = Array.isArray(ctx.context?.paperclipBoard) ? ctx.context.paperclipBoard : [];
++    let boardData = "";
++    if (boardIssues.length > 0) {
++        boardData = boardIssues
++            .map((i) => `${i.identifier || i.id}  ${(i.status || "").padStart(12)}  ${(i.priority || "").padStart(6)}  ${i.title}`)
++            .join("\n");
++    }
++    vars.boardData = boardData;
+     // Handle conditional sections: {{#key}}...{{/key}}
+     let rendered = template;
+     // {{#taskId}}...{{/taskId}} — include if task is assigned
+@@ -132,163 +176,85 @@ function buildPrompt(ctx, config) {
+     rendered = rendered.replace(/\{\{#noTask\}\}([\s\S]*?)\{\{\/noTask\}\}/g, taskId ? "" : "$1");
+     // {{#commentId}}...{{/commentId}} — include if comment exists
+     rendered = rendered.replace(/\{\{#commentId\}\}([\s\S]*?)\{\{\/commentId\}\}/g, commentId ? "$1" : "");
++    // {{#boardData}}...{{/boardData}} — include if board data is available
++    rendered = rendered.replace(/\{\{#boardData\}\}([\s\S]*?)\{\{\/boardData\}\}/g, boardData ? "$1" : "");
++    // {{#noBoardData}}...{{/noBoardData}} — include if no board data (fallback to curl)
++    rendered = rendered.replace(/\{\{#noBoardData\}\}([\s\S]*?)\{\{\/noBoardData\}\}/g, boardData ? "" : "$1");
+     // Replace remaining {{variable}} placeholders
+     return renderTemplate(rendered, vars);
+ }
+ // ---------------------------------------------------------------------------
+-// Output parsing
+-// ---------------------------------------------------------------------------
+-/** Regex to extract session ID from Hermes quiet-mode output: "session_id: <id>" */
+-const SESSION_ID_REGEX = /^session_id:\s*(\S+)/m;
+-/** Regex for legacy session output format */
+-const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i;
+-/** Regex to extract token usage from Hermes output. */
+-const TOKEN_USAGE_REGEX = /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
+-/** Regex to extract cost from Hermes output. */
+-const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+-// ---------------------------------------------------------------------------
+-// Response cleaning
+-// ---------------------------------------------------------------------------
+-/** Strip noise lines from a Hermes response (tool output, system messages, etc.) */
+-function cleanResponse(raw) {
+-    return raw
+-        .split("\n")
+-        .filter((line) => {
+-        const t = line.trim();
+-        if (!t)
+-            return true; // keep blank lines for paragraph separation
+-        if (t.startsWith("[tool]") || t.startsWith("[hermes]") || t.startsWith("[paperclip]"))
+-            return false;
+-        if (t.startsWith("session_id:"))
+-            return false;
+-        if (/^\[\d{4}-\d{2}-\d{2}T/.test(t))
+-            return false;
+-        if (/^\[done\]\s*┊/.test(t))
+-            return false;
+-        if (/^┊\s*[\p{Emoji_Presentation}]/u.test(t) && !/^┊\s*💬/.test(t))
+-            return false;
+-        if (/^\p{Emoji_Presentation}\s*(Completed|Running|Error)?\s*$/u.test(t))
+-            return false;
+-        return true;
+-    })
+-        .map((line) => {
+-        let t = line.replace(/^[\s]*┊\s*💬\s*/, "").trim();
+-        t = t.replace(/^\[done\]\s*/, "").trim();
+-        return t;
+-    })
+-        .join("\n")
+-        .replace(/\n{3,}/g, "\n\n")
+-        .trim();
+-}
+-// ---------------------------------------------------------------------------
+-// Output parsing
++// ClawRouter HTTP client
+ // ---------------------------------------------------------------------------
+-function parseHermesOutput(stdout, stderr) {
+-    const combined = stdout + "\n" + stderr;
+-    const result = {};
+-    // In quiet mode, Hermes outputs:
+-    //   <response text>
+-    //
+-    //   session_id: <id>
+-    const sessionMatch = stdout.match(SESSION_ID_REGEX);
+-    if (sessionMatch?.[1]) {
+-        result.sessionId = sessionMatch?.[1] ?? null;
+-        // The response is everything before the session_id line
+-        const sessionLineIdx = stdout.lastIndexOf("\nsession_id:");
+-        if (sessionLineIdx > 0) {
+-            result.response = cleanResponse(stdout.slice(0, sessionLineIdx));
+-        }
+-    }
+-    else {
+-        // Legacy format (non-quiet mode)
+-        const legacyMatch = combined.match(SESSION_ID_REGEX_LEGACY);
+-        if (legacyMatch?.[1]) {
+-            result.sessionId = legacyMatch?.[1] ?? null;
+-        }
+-        // In non-quiet mode, extract clean response from stdout by
+-        // filtering out tool lines, system messages, and noise
+-        const cleaned = cleanResponse(stdout);
+-        if (cleaned.length > 0) {
+-            result.response = cleaned;
+-        }
+-    }
+-    // Extract token usage
+-    const usageMatch = combined.match(TOKEN_USAGE_REGEX);
+-    if (usageMatch) {
+-        result.usage = {
+-            inputTokens: parseInt(usageMatch[1], 10) || 0,
+-            outputTokens: parseInt(usageMatch[2], 10) || 0,
++/**
++ * POST to ClawRouter's /v1/messages endpoint (Anthropic Messages API format).
++ * ClawRouter auto-classifies by complexity (LIGHT/MEDIUM/HEAVY) and routes
++ * to the appropriate backend (Ollama Cloud, OpenAI, MacBook, etc.).
++ */
++function postToClawRouter(url, body, timeoutMs) {
++    return new Promise((resolve, reject) => {
++        const parsed = new URL(url);
++        const requestBody = JSON.stringify(body);
++        const options = {
++            hostname: parsed.hostname,
++            port: parsed.port || 8402,
++            path: parsed.pathname || "/v1/messages",
++            method: "POST",
++            headers: {
++                "Content-Type": "application/json",
++                "Content-Length": Buffer.byteLength(requestBody),
++                "anthropic-version": "2023-06-01",
++            },
++            timeout: timeoutMs,
+         };
+-    }
+-    // Extract cost
+-    const costMatch = combined.match(COST_REGEX);
+-    if (costMatch?.[1]) {
+-        result.costUsd = parseFloat(costMatch[1]);
+-    }
+-    // Check for error patterns in stderr
+-    if (stderr.trim()) {
+-        const errorLines = stderr
+-            .split("\n")
+-            .filter((line) => /error|exception|traceback|failed/i.test(line))
+-            .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
+-        if (errorLines.length > 0) {
+-            result.errorMessage = errorLines.slice(0, 5).join("\n");
+-        }
+-    }
+-    return result;
++        const req = http.request(options, (res) => {
++            let data = "";
++            res.on("data", (chunk) => (data += chunk));
++            res.on("end", () => {
++                try {
++                    const response = JSON.parse(data);
++                    if (res.statusCode >= 400) {
++                        const errMsg = response?.error?.message || data.slice(0, 500);
++                        reject(new Error(`ClawRouter HTTP ${res.statusCode}: ${errMsg}`));
++                    } else {
++                        resolve(response);
++                    }
++                } catch (e) {
++                    reject(new Error(`Invalid JSON from ClawRouter: ${data.slice(0, 500)}`));
++                }
++            });
++        });
++        req.on("error", (err) => reject(new Error(`ClawRouter connection error: ${err.message}`)));
++        req.on("timeout", () => {
++            req.destroy();
++            reject(new Error(`ClawRouter request timed out after ${timeoutMs}ms`));
++        });
++        req.write(requestBody);
++        req.end();
++    });
+ }
+ // ---------------------------------------------------------------------------
+-// Main execute
++// Main execute — direct to ClawRouter
+ // ---------------------------------------------------------------------------
+ export async function execute(ctx) {
+     const config = (ctx.agent?.adapterConfig ?? {});
+     // ── Resolve configuration ──────────────────────────────────────────────
+-    const hermesCmd = cfgString(config.hermesCommand) || HERMES_CLI;
+-    const model = cfgString(config.model);
+-    const provider = cfgString(config.provider);
++    const clawRouterUrl = cfgString(config.clawRouterUrl) ||
++        process.env.CLAW_ROUTER_URL ||
++        "http://127.0.0.1:8402/v1/messages";
++    // Model hint for ClawRouter — it auto-routes based on content complexity
++    // but this serves as the default/fallback model string.
++    const model = cfgString(config.model) || "gemma4:31b";
++    // Maximize output tokens. ClawRouter enforces Math.max(requested, 2048).
++    // gemma4:31b has num_ctx=65536, qwen3.5:397b has num_ctx=100000.
++    // 16384 output tokens leaves ~49K input tokens on LIGHT/MEDIUM tier.
++    const maxTokens = cfgNumber(config.maxTokens) || 16384;
+     const timeoutSec = cfgNumber(config.timeoutSec) || DEFAULT_TIMEOUT_SEC;
+-    const graceSec = cfgNumber(config.graceSec) || DEFAULT_GRACE_SEC;
+-    const toolsets = cfgString(config.toolsets) || cfgStringArray(config.enabledToolsets)?.join(",");
+-    const extraArgs = cfgStringArray(config.extraArgs);
+-    const persistSession = cfgBoolean(config.persistSession) !== false;
+-    const worktreeMode = cfgBoolean(config.worktreeMode) === true;
+-    const checkpoints = cfgBoolean(config.checkpoints) === true;
+     // ── Build prompt ───────────────────────────────────────────────────────
+     const prompt = buildPrompt(ctx, config);
+-    // ── Build command args ─────────────────────────────────────────────────
+-    // Use -Q (quiet) to get clean output: just response + session_id line
+-    const useQuiet = cfgBoolean(config.quiet) !== false; // default true
+-    const args = ["chat", "-q", prompt];
+-    if (useQuiet)
+-        args.push("-Q");
+-    if (model) {
+-        args.push("-m", model);
+-    }
+-    // Only pass --provider if it's a valid Hermes provider choice.
+-    if (provider && VALID_PROVIDERS.includes(provider)) {
+-        args.push("--provider", provider);
+-    }
+-    if (toolsets) {
+-        args.push("-t", toolsets);
+-    }
+-    if (worktreeMode)
+-        args.push("-w");
+-    if (checkpoints)
+-        args.push("--checkpoints");
+-    if (cfgBoolean(config.verbose) === true)
+-        args.push("-v");
+-    // Tag sessions as "tool" source so they don't clutter the user's session history.
+-    // Requires hermes-agent >= PR #3255 (feat/session-source-tag).
+-    args.push("--source", "tool");
+-    // Session resume
+-    const prevSessionId = cfgString(ctx.runtime?.sessionParams?.sessionId);
+-    if (persistSession && prevSessionId) {
+-        args.push("--resume", prevSessionId);
+-    }
+-    if (extraArgs?.length) {
+-        args.push(...extraArgs);
+-    }
+     // ── Build environment ──────────────────────────────────────────────────
++    // Still set env vars so PAPERCLIP_AGENT_KEY is available to the process
++    // (the prompt references $PAPERCLIP_AGENT_KEY in curl commands).
+     const env = {
+         ...process.env,
+         ...buildPaperclipEnv(ctx.agent),
+@@ -302,88 +268,89 @@ export async function execute(ctx) {
+     if (userEnv && typeof userEnv === "object") {
+         Object.assign(env, userEnv);
+     }
+-    // ── Resolve working directory ──────────────────────────────────────────
+-    const cwd = cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+-    try {
+-        await ensureAbsoluteDirectory(cwd);
+-    }
+-    catch {
+-        // Non-fatal
+-    }
++    // Propagate to process.env so child processes (if any) inherit
++    Object.assign(process.env, env);
+     // ── Log start ──────────────────────────────────────────────────────────
+-    await ctx.onLog("stdout", `[hermes] Starting Hermes Agent (model=${model ?? "configured-default"}, timeout=${timeoutSec}s)\n`);
+-    if (prevSessionId) {
+-        await ctx.onLog("stdout", `[hermes] Resuming session: ${prevSessionId}\n`);
+-    }
++    await ctx.onLog("stdout", `[clawrouter] Posting directly to ClawRouter (model=${model}, max_tokens=${maxTokens}, timeout=${timeoutSec}s)\n`);
++    await ctx.onLog("stdout", `[clawrouter] URL: ${clawRouterUrl}\n`);
++    // ── Build Anthropic Messages API request body ────────────────────────
++    // ClawRouter accepts Anthropic /v1/messages format, auto-classifies
++    // by complexity (LIGHT/MEDIUM/HEAVY), converts to OpenAI internally,
++    // and routes to the appropriate Ollama Cloud backend.
++    const requestBody = {
++        model,
++        max_tokens: maxTokens,
++        messages: [
++            { role: "user", content: prompt },
++        ],
++    };
+     // ── Execute ────────────────────────────────────────────────────────────
+-    // Hermes writes non-error noise to stderr (MCP init, INFO logs, etc).
+-    // Paperclip renders all stderr as red/error in the UI.
+-    // Wrap onLog to reclassify benign stderr lines as stdout.
+-    const wrappedOnLog = async (stream, chunk) => {
+-        if (stream === "stderr") {
+-            const trimmed = chunk.trimEnd();
+-            // Benign patterns that should NOT appear as errors:
+-            // - Structured log lines: [timestamp] INFO/DEBUG/WARN: ...
+-            // - MCP server registration messages
+-            // - Python import/site noise
+-            const isBenign = /^\[?\d{4}[-/]\d{2}[-/]\d{2}T/.test(trimmed) || // structured timestamps
+-                /^[A-Z]+:\s+(INFO|DEBUG|WARN|WARNING)\b/.test(trimmed) || // log levels
+-                /Successfully registered all tools/.test(trimmed) ||
+-                /MCP [Ss]erver/.test(trimmed) ||
+-                /tool registered successfully/.test(trimmed) ||
+-                /Application initialized/.test(trimmed);
+-            if (isBenign) {
+-                return ctx.onLog("stdout", chunk);
+-            }
++    try {
++        const response = await postToClawRouter(
++            clawRouterUrl,
++            requestBody,
++            timeoutSec * 1000
++        );
++        // Parse response — ClawRouter returns OpenAI-compatible format (choices[0].message.content)
++        // Fall back to Anthropic format (content[].text) for forward-compat
++        const responseText =
++            (response.choices && response.choices.length > 0
++                ? response.choices.map((c) => c.message?.content ?? "").join("")
++                : null) ??
++            (response.content || [])
++                .filter((b) => b.type === "text")
++                .map((b) => b.text ?? "")
++                .join("");
++        await ctx.onLog("stdout", `[clawrouter] Response received (${responseText.length} chars, routed_model=${response.model || model})\n`);
++        if (response.usage) {
++            await ctx.onLog("stdout", `[clawrouter] Usage: ${response.usage.input_tokens || 0} input, ${response.usage.output_tokens || 0} output tokens\n`);
+         }
+-        return ctx.onLog(stream, chunk);
+-    };
+-    const result = await runChildProcess(ctx.runId, hermesCmd, args, {
+-        cwd,
+-        env,
+-        timeoutSec,
+-        graceSec,
+-        onLog: wrappedOnLog,
+-    });
+-    // ── Parse output ───────────────────────────────────────────────────────
+-    const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
+-    await ctx.onLog("stdout", `[hermes] Exit code: ${result.exitCode ?? "null"}, timed out: ${result.timedOut}\n`);
+-    if (parsed.sessionId) {
+-        await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
+-    }
+-    // ── Build result ───────────────────────────────────────────────────────
+-    const executionResult = {
+-        exitCode: result.exitCode,
+-        signal: result.signal,
+-        timedOut: result.timedOut,
+-        provider: provider || null,
+-        model: model || null,
+-    };
+-    if (parsed.errorMessage) {
+-        executionResult.errorMessage = parsed.errorMessage;
+-    }
+-    if (parsed.usage) {
+-        executionResult.usage = parsed.usage;
+-    }
+-    if (parsed.costUsd !== undefined) {
+-        executionResult.costUsd = parsed.costUsd;
+-    }
+-    // Summary from agent response
+-    if (parsed.response) {
+-        executionResult.summary = parsed.response.slice(0, 2000);
+-    }
+-    // Set resultJson so Paperclip can persist run metadata (used for UI display + auto-comments)
+-    executionResult.resultJson = {
+-        result: parsed.response || "",
+-        session_id: parsed.sessionId || null,
+-        usage: parsed.usage || null,
+-        cost_usd: parsed.costUsd ?? null,
+-    };
+-    // Store session ID for next run
+-    if (persistSession && parsed.sessionId) {
+-        executionResult.sessionParams = { sessionId: parsed.sessionId };
+-        executionResult.sessionDisplayId = parsed.sessionId.slice(0, 16);
++        if (responseText.length > 0) {
++            await ctx.onLog("stdout", `[clawrouter] Response preview: ${responseText.slice(0, 200)}${responseText.length > 200 ? "..." : ""}\n`);
++        }
++        // ── Build result ───────────────────────────────────────────────────
++        const executionResult = {
++            exitCode: 0,
++            signal: null,
++            timedOut: false,
++            provider: "clawrouter",
++            model: response.model || model,
++        };
++        if (response.usage) {
++            executionResult.usage = {
++                inputTokens: response.usage.input_tokens || 0,
++                outputTokens: response.usage.output_tokens || 0,
++            };
++        }
++        // Summary from model response
++        if (responseText) {
++            executionResult.summary = responseText.slice(0, 2000);
++        }
++        // resultJson for Paperclip persistence (UI display + auto-comments)
++        executionResult.resultJson = {
++            result: responseText,
++            session_id: null,
++            usage: executionResult.usage || null,
++            cost_usd: null,
++        };
++        return executionResult;
++    } catch (err) {
++        const isTimeout = err.message.includes("timed out");
++        await ctx.onLog("stderr", `[clawrouter] ${isTimeout ? "Timeout" : "Error"}: ${err.message}\n`);
++        return {
++            exitCode: 1,
++            signal: null,
++            timedOut: isTimeout,
++            provider: "clawrouter",
++            model,
++            errorMessage: err.message,
++            resultJson: {
++                result: "",
++                session_id: null,
++                usage: null,
++                cost_usd: null,
++            },
++        };
+     }
+-    return executionResult;
+ }
+ //# sourceMappingURL=execute.js.map
