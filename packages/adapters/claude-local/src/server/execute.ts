@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -299,8 +300,175 @@ export async function runClaudeLogin(input: {
   });
 }
 
+// ---------------------------------------------------------------------------
+// ClawRouter direct HTTP path — bypasses Claude CLI entirely
+// ---------------------------------------------------------------------------
+
+interface ClawRouterResponse {
+  // Anthropic format
+  content?: Array<{ type: string; text?: string }>;
+  usage?: { input_tokens?: number; output_tokens?: number };
+  model?: string;
+  error?: { message?: string };
+  // OpenAI-compatible format (what ClawRouter actually returns)
+  choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+}
+
+function postToClawRouter(
+  url: string,
+  body: Record<string, unknown>,
+  timeoutMs: number,
+): Promise<ClawRouterResponse> {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const requestBody = JSON.stringify(body);
+    const options: http.RequestOptions = {
+      hostname: parsed.hostname,
+      port: parsed.port || 8402,
+      path: parsed.pathname || "/v1/messages",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(requestBody),
+        "anthropic-version": "2023-06-01",
+      },
+      timeout: timeoutMs,
+    };
+    const req = http.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk: Buffer) => (data += chunk));
+      res.on("end", () => {
+        try {
+          const response = JSON.parse(data) as ClawRouterResponse;
+          if ((res.statusCode ?? 0) >= 400) {
+            const errMsg = response?.error?.message || data.slice(0, 500);
+            reject(new Error(`ClawRouter HTTP ${res.statusCode}: ${errMsg}`));
+          } else {
+            resolve(response);
+          }
+        } catch {
+          reject(new Error(`Invalid JSON from ClawRouter: ${data.slice(0, 500)}`));
+        }
+      });
+    });
+    req.on("error", (err: Error) => reject(new Error(`ClawRouter connection error: ${err.message}`)));
+    req.on("timeout", () => {
+      req.destroy();
+      reject(new Error(`ClawRouter request timed out after ${timeoutMs}ms`));
+    });
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+/**
+ * Fast-path execution for clawrouter/* models.
+ * Posts directly to ClawRouter's /v1/messages endpoint instead of spawning
+ * the Claude CLI (which would reject the non-Claude model string).
+ */
+async function executeViaClawRouter(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const { config, context, onLog } = ctx;
+  const model = asString(config.model, "clawrouter/auto");
+  const clawRouterUrl =
+    asString(config.clawRouterUrl, "") ||
+    process.env.CLAW_ROUTER_URL ||
+    "http://127.0.0.1:8402/v1/messages";
+  const maxTokens = asNumber(config.clawRouterMaxTokens, 16384);
+  const timeoutSec = asNumber(config.timeoutSec, 600);
+
+  // Build prompt using the same template logic as the normal path
+  const promptTemplate = asString(
+    config.promptTemplate,
+    "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
+  );
+  const templateData = {
+    agentId: ctx.agent.id,
+    companyId: ctx.agent.companyId,
+    runId: ctx.runId,
+    company: { id: ctx.agent.companyId },
+    agent: ctx.agent,
+    run: { id: ctx.runId, source: "on_demand" },
+    context,
+  };
+  const renderedPrompt = renderTemplate(promptTemplate, templateData);
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: false });
+  const prompt = joinPromptSections([wakePrompt, renderedPrompt]);
+
+  await onLog("stdout", `[clawrouter] Posting directly to ClawRouter (model=${model}, max_tokens=${maxTokens}, timeout=${timeoutSec}s)\n`);
+  await onLog("stdout", `[clawrouter] URL: ${clawRouterUrl}\n`);
+
+  const requestBody = {
+    model,
+    max_tokens: maxTokens,
+    messages: [{ role: "user", content: prompt }],
+  };
+
+  try {
+    const response = await postToClawRouter(clawRouterUrl, requestBody, timeoutSec * 1000);
+    // ClawRouter returns OpenAI-compatible format; fall back to Anthropic format
+    const responseText =
+      (response.choices && response.choices.length > 0
+        ? response.choices.map((c) => c.message?.content ?? "").join("")
+        : null) ??
+      (response.content || [])
+        .filter((b) => b.type === "text")
+        .map((b) => b.text ?? "")
+        .join("");
+
+    await onLog("stdout", `[clawrouter] Response received (${responseText.length} chars, routed_model=${response.model || model})\n`);
+    if (response.usage) {
+      await onLog("stdout", `[clawrouter] Usage: ${response.usage.input_tokens || 0} input, ${response.usage.output_tokens || 0} output tokens\n`);
+    }
+    if (responseText.length > 0) {
+      await onLog("stdout", `[clawrouter] Response preview: ${responseText.slice(0, 200)}${responseText.length > 200 ? "..." : ""}\n`);
+    }
+
+    return {
+      exitCode: 0,
+      signal: null,
+      timedOut: false,
+      provider: "clawrouter",
+      model: response.model || model,
+      usage: response.usage
+        ? {
+            inputTokens: response.usage.input_tokens || 0,
+            cachedInputTokens: 0,
+            outputTokens: response.usage.output_tokens || 0,
+          }
+        : undefined,
+      summary: responseText.slice(0, 2000),
+      resultJson: {
+        result: responseText,
+        session_id: null,
+        usage: response.usage || null,
+        cost_usd: null,
+      },
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    const isTimeout = message.includes("timed out");
+    await onLog("stderr", `[clawrouter] ${isTimeout ? "Timeout" : "Error"}: ${message}\n`);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: isTimeout,
+      errorMessage: message,
+      provider: "clawrouter",
+      model,
+      resultJson: { result: "", session_id: null, usage: null, cost_usd: null },
+    };
+  }
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+
+  // ── ClawRouter fast-path: bypass Claude CLI for clawrouter/* models ────
+  const configuredModel = asString(config.model, "");
+  if (configuredModel.startsWith("clawrouter/")) {
+    return executeViaClawRouter(ctx);
+  }
+
   const executionTarget = readAdapterExecutionTarget({
     executionTarget: ctx.executionTarget,
     legacyRemoteExecution: ctx.executionTransport?.remoteExecution,

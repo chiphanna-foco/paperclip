@@ -208,7 +208,12 @@ describe("server adapter registry", () => {
     expect(setOverridePaused("claude_local", true)).toBe(true);
 
     expect(findActiveServerAdapter("claude_local")).not.toBe(plugin);
-    expect(await listAdapterModels("claude_local")).toEqual(builtIn?.models ?? []);
+    // listAdapterModels prefers listModels() over the static `.models` field, so
+    // compare against the same resolution that the runtime would actually return.
+    const expectedBuiltinModels = builtIn?.listModels
+      ? await builtIn.listModels()
+      : (builtIn?.models ?? []);
+    expect(await listAdapterModels("claude_local")).toEqual(expectedBuiltinModels);
     expect(await detectAdapterModel("claude_local")).toBeNull();
     expect(detectModel).toHaveBeenCalledTimes(1);
   });

@@ -125,7 +125,10 @@ const claudeLocalAdapter: ServerAdapterModule = {
   syncSkills: syncClaudeSkills,
   sessionCodec: claudeSessionCodec,
   sessionManagement: getAdapterSessionManagement("claude_local") ?? undefined,
-  models: claudeModels,
+  models: [
+    ...claudeModels,
+    { id: "clawrouter/auto", label: "ClawRouter (auto)" },
+  ],
   listModels: listClaudeModels,
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,
@@ -290,7 +293,10 @@ const hermesLocalAdapter: ServerAdapterModule = {
   sessionCodec: hermesSessionCodec,
   listSkills: hermesListSkills,
   syncSkills: hermesSyncSkills,
-  models: hermesModels,
+  models: [
+    ...hermesModels,
+    { id: "clawrouter/auto", label: "ClawRouter (auto)" },
+  ],
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: false,
   requiresMaterializedRuntimeSkills: false,
