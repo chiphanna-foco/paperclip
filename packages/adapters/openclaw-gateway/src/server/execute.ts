@@ -1127,7 +1127,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const templateMessage = nonEmpty(payloadTemplate.message) ?? nonEmpty(payloadTemplate.text);
   const message = templateMessage ? appendWakeText(templateMessage, wakeText) : wakeText;
-  const paperclipPayload = buildStandardPaperclipPayload(ctx, wakePayload, paperclipEnv, payloadTemplate);
 
   const agentParams: Record<string, unknown> = {
     ...payloadTemplate,
@@ -1136,7 +1135,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     idempotencyKey: ctx.runId,
   };
   delete agentParams.text;
-  agentParams.paperclip = paperclipPayload;
+  // Do NOT set agentParams.paperclip here. The OpenClaw Gateway agent-params
+  // schema is strict (`additionalProperties: false`) and rejects unknown
+  // root-level fields with "invalid agent params: at root: unexpected
+  // property 'paperclip'". The structured wake context is already in the
+  // `message` field via wakeText / structuredWakeJson. See commits 6c9e639a
+  // (original fix) and 91e040a6 (regression).
+  delete agentParams.paperclip;
 
   const configuredAgentId = nonEmpty(ctx.config.agentId);
   if (configuredAgentId && !nonEmpty(agentParams.agentId)) {

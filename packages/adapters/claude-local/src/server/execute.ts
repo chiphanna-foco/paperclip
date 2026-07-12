@@ -231,7 +231,28 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     env.PAPERCLIP_API_KEY = authToken;
   }
 
-  const runtimeEnv = ensurePathInEnv({ ...process.env, ...env });
+  // The control-plane server may itself be running inside a Claude Code
+  // session (dev shells started from Claude Desktop / SSH). Host-session vars
+  // like CLAUDECODE and CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH make a spawned
+  // `claude` CLI defer auth to a host that doesn't exist for it, so every
+  // agent run fails with "Not logged in". Never let agent runs inherit them;
+  // explicit adapter-config env (spread after) still wins.
+  const inheritedEnv: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value === undefined) continue;
+    if (
+      key === "CLAUDECODE" ||
+      key === "CLAUDE_EFFORT" ||
+      key === "CLAUDE_AGENT_SDK_VERSION" ||
+      key.startsWith("CLAUDE_CODE_") ||
+      key === "ANTHROPIC_API_KEY" ||
+      key === "ANTHROPIC_BASE_URL"
+    ) {
+      continue;
+    }
+    inheritedEnv[key] = value;
+  }
+  const runtimeEnv = ensurePathInEnv({ ...inheritedEnv, ...env });
   await ensureAdapterExecutionTargetCommandResolvable(command, executionTarget, cwd, runtimeEnv);
   const resolvedCommand = await resolveAdapterExecutionTargetCommandForLogs(command, executionTarget, cwd, runtimeEnv);
   const loggedEnv = buildInvocationEnvForLogs(env, {

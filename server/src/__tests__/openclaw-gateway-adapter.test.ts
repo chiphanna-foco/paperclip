@@ -502,12 +502,14 @@ describe("openclaw gateway adapter execute", () => {
       );
       expect(String(payload?.message ?? "")).toContain("First comment");
       expect(String(payload?.message ?? "")).toContain("\"commentIds\":[\"comment-1\",\"comment-2\"]");
-      expect(payload?.paperclip).toMatchObject({
-        wake: {
-          latestCommentId: "comment-2",
-          commentIds: ["comment-1", "comment-2"],
-        },
-      });
+      // Regression: the OpenClaw Gateway agent-params schema uses
+      // `additionalProperties: false`, so a root-level `paperclip` field
+      // is rejected with "invalid agent params: at root: unexpected
+      // property 'paperclip'". The structured wake context lives in
+      // `message` instead. See commits 6c9e639a (original fix) and
+      // 91e040a6 (regression that re-introduced it).
+      expect(payload).not.toHaveProperty("paperclip");
+      expect(String(payload?.message ?? "")).toContain("\"latestCommentId\":\"comment-2\"");
 
       expect(logs.some((entry) => entry.includes("[openclaw-gateway:event] run=run-123 stream=assistant"))).toBe(true);
     } finally {

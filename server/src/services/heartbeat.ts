@@ -2590,6 +2590,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    // Wakes without an issue/project context (e.g. manual board wakes) get
+    // here. Before dropping the run into the per-agent isolated home dir,
+    // honor the agent's configured cwd from adapter_config — that's the
+    // working directory the agent owner pointed the agent at, and is
+    // typically the project workspace path. This eliminates the noisy
+    // "No project or prior session workspace was available" warning when
+    // the agent already knows where it should run.
+    const agentConfiguredCwd = readNonEmptyString(parseObject(agent.adapterConfig).cwd);
+    if (agentConfiguredCwd) {
+      const agentCwdExists = await fs
+        .stat(agentConfiguredCwd)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+      if (agentCwdExists) {
+        return {
+          cwd: agentConfiguredCwd,
+          source: "project_primary" as const,
+          projectId: resolvedProjectId,
+          workspaceId: null,
+          repoUrl: null,
+          repoRef: null,
+          workspaceHints,
+          warnings: [],
+        };
+      }
+    }
+
     const cwd = resolveDefaultAgentWorkspaceDir(agent.id);
     await fs.mkdir(cwd, { recursive: true });
     const warnings: string[] = [];

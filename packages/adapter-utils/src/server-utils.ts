@@ -1489,6 +1489,13 @@ export async function runChildProcess(
       "CLAUDE_CODE_ENTRYPOINT",
       "CLAUDE_CODE_SESSION",
       "CLAUDE_CODE_PARENT_SESSION",
+      // Host-managed-auth markers: when inherited, a spawned `claude` defers
+      // credential refresh to a host session that doesn't exist for it and
+      // every run dies with "Not logged in · Please run /login" (bisected
+      // empirically 2026-07-09; PROVIDER_MANAGED_BY_HOST alone reproduces it).
+      "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+      "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH",
+      "CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH",
     ] as const;
     for (const key of CLAUDE_CODE_NESTING_VARS) {
       delete rawMerged[key];
