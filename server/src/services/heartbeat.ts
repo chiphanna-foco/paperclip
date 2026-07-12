@@ -39,6 +39,7 @@ import {
   documentAnnotationComments,
   documentAnnotationThreads,
   documentRevisions,
+  goals,
   issueDocuments,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -49,6 +50,7 @@ import {
   issueThreadInteractions,
   issues,
   issueWorkProducts,
+  projectGoals as projectGoalsTable,
   projects,
   projectWorkspaces,
   routineRevisions,
@@ -4017,6 +4019,8 @@ export async function buildPaperclipWakePayload(input: {
         status: string;
         priority: string;
         workMode: string;
+        description?: string | null;
+        goalId?: string | null;
         projectId?: string | null;
         executionPolicy?: unknown;
       }
@@ -4036,14 +4040,50 @@ export async function buildPaperclipWakePayload(input: {
             id: issues.id,
             identifier: issues.identifier,
             title: issues.title,
+            description: issues.description,
             status: issues.status,
             priority: issues.priority,
             workMode: issues.workMode,
+            goalId: issues.goalId,
+            projectId: issues.projectId,
           })
           .from(issues)
           .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)))
           .then((rows) => rows[0] ?? null)
       : null);
+
+  // Fetch linked goal + any project-level goals so agents see the "why"
+  // behind the task, not just the task itself.
+  let issueGoal: { id: string; title: string; description: string | null; level: string } | null = null;
+  if (issueSummary?.goalId) {
+    issueGoal = await input.db
+      .select({
+        id: goals.id,
+        title: goals.title,
+        description: goals.description,
+        level: goals.level,
+      })
+      .from(goals)
+      .where(and(eq(goals.id, issueSummary.goalId), eq(goals.companyId, input.companyId)))
+      .then((rows) => rows[0] ?? null);
+  }
+  let projectGoals: Array<{ id: string; title: string; description: string | null; level: string }> = [];
+  if (!issueGoal && issueSummary?.projectId) {
+    projectGoals = await input.db
+      .select({
+        id: goals.id,
+        title: goals.title,
+        description: goals.description,
+        level: goals.level,
+      })
+      .from(goals)
+      .innerJoin(projectGoalsTable, eq(projectGoalsTable.goalId, goals.id))
+      .where(and(
+        eq(projectGoalsTable.projectId, issueSummary.projectId),
+        eq(goals.companyId, input.companyId),
+      ))
+      .limit(3);
+  }
   if (commentIds.length === 0 && Object.keys(executionStage).length === 0 && !issueSummary) return null;
 
   const commentRows =
@@ -4211,9 +4251,11 @@ export async function buildPaperclipWakePayload(input: {
           id: issueSummary.id,
           identifier: issueSummary.identifier,
           title: issueSummary.title,
+          description: issueSummary.description,
           status: issueSummary.status,
           priority: issueSummary.priority,
           workMode: issueSummary.workMode,
+          goalId: issueSummary.goalId,
         }
       : null,
     childIssueSummaries: Array.isArray(input.contextSnapshot.childIssueSummaries)
@@ -4236,6 +4278,8 @@ export async function buildPaperclipWakePayload(input: {
     interactionKind,
     interactionStatus,
     checkboxSelection: Object.keys(checkboxSelection).length > 0 ? checkboxSelection : null,
+    goal: issueGoal,
+    projectGoals,
     checkedOutByHarness: input.contextSnapshot[PAPERCLIP_HARNESS_CHECKOUT_KEY] === true,
     dependencyBlockedInteraction: input.contextSnapshot.dependencyBlockedInteraction === true,
     treeHoldInteraction: input.contextSnapshot.treeHoldInteraction === true,
@@ -6473,6 +6517,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           workspaceId: readNonEmptyString(previousSessionParams?.workspaceId),
           repoUrl: readNonEmptyString(previousSessionParams?.repoUrl),
           repoRef: readNonEmptyString(previousSessionParams?.repoRef),
+          workspaceHints,
+          warnings: [],
+        };
+      }
+    }
+
+    // Wakes without an issue/project context (e.g. manual board wakes) get
+    // here. Before dropping the run into the per-agent isolated home dir,
+    // honor the agent's configured cwd from adapter_config — that's the
+    // working directory the agent owner pointed the agent at, and is
+    // typically the project workspace path. This eliminates the noisy
+    // "No project or prior session workspace was available" warning when
+    // the agent already knows where it should run.
+    const agentConfiguredCwd = readNonEmptyString(parseObject(agent.adapterConfig).cwd);
+    if (agentConfiguredCwd) {
+      const agentCwdExists = await fs
+        .stat(agentConfiguredCwd)
+        .then((stats) => stats.isDirectory())
+        .catch(() => false);
+      if (agentCwdExists) {
+        return {
+          cwd: agentConfiguredCwd,
+          source: "project_primary" as const,
+          projectId: resolvedProjectId,
+          workspaceId: null,
+          repoUrl: null,
+          repoRef: null,
           workspaceHints,
           warnings: [],
         };
@@ -11893,6 +11964,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               billingType: normalizeLedgerBillingType(adapterResult.billingType),
             } as Record<string, unknown>)
           : null;
+
+      // Legacy ACTION-block processing removed (2026-04-19). Agents on
+      // codex_local now call the $paperclip skill directly instead of
+      // embedding fenced `action:<type>` blocks in their prose output.
 
       const persistedResultJson = mergeHeartbeatRunResultJson(
         mergeRunStopMetadataForAgent(agent, outcome, {

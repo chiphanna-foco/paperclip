@@ -705,6 +705,42 @@ describe("realizeExecutionWorkspace", () => {
     ]);
   });
 
+  it("falls back to project_primary when baseCwd is not a git repo (e.g. agent_home fallback for context-less manual wakes)", async () => {
+    const nonGitDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-git-"));
+
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: nonGitDir,
+        source: "agent_home",
+        projectId: null,
+        workspaceId: null,
+        repoUrl: null,
+        repoRef: null,
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          baseRef: "main",
+          branchTemplate: "paperclip/{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: null,
+      agent: {
+        id: "agent-1",
+        name: "FullStackEngineer",
+        companyId: "company-1",
+      },
+    });
+
+    expect(realized.strategy).toBe("project_primary");
+    expect(realized.cwd).toBe(nonGitDir);
+    expect(realized.branchName).toBeNull();
+    expect(realized.worktreePath).toBeNull();
+    expect(realized.created).toBe(false);
+    expect(realized.warnings.length).toBeGreaterThan(0);
+    expect(realized.warnings.some((w) => /git_worktree/i.test(w))).toBe(true);
+  });
+
   it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-447-add-worktree-support";

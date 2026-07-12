@@ -22,10 +22,20 @@ export function AuthPage() {
   const [error, setError] = useState<string | null>(null);
   const errorId = "auth-error";
 
-  const nextPath = useMemo(
-    () => searchParams.get("next") || getRememberedInvitePath() || "/",
-    [searchParams],
-  );
+  const nextPath = useMemo(() => {
+    const raw = searchParams.get("next");
+    if (!raw) return getRememberedInvitePath() || "/";
+    // Decode once more in case the URL is double-encoded (e.g., %252F → %2F → /)
+    // This can happen when iOS Safari saves/restores PWA URLs
+    let path = raw;
+    try {
+      const decoded = decodeURIComponent(raw);
+      if (decoded.startsWith("/")) path = decoded;
+    } catch {
+      // ignore decode errors, use raw value
+    }
+    return path.startsWith("/") ? path : "/";
+  }, [searchParams]);
   const { data: session, isLoading: isSessionLoading } = useQuery({
     queryKey: queryKeys.auth.session,
     queryFn: () => authApi.getSession(),

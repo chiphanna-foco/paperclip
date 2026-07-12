@@ -1624,6 +1624,24 @@ export async function realizeExecutionWorkspace(input: {
     };
   }
 
+  // git_worktree requires a git checkout. On context-less wakes (manual
+  // board trigger with no issue/project), the resolved baseCwd may be the
+  // agent_home fallback, which is not a git repo. Fall back to
+  // project_primary instead of crashing the run on `git rev-parse`.
+  if (!(await isGitCheckout(input.base.baseCwd))) {
+    return {
+      ...input.base,
+      strategy: "project_primary",
+      cwd: input.base.baseCwd,
+      branchName: null,
+      worktreePath: null,
+      warnings: [
+        `Workspace strategy "git_worktree" requested but base cwd "${input.base.baseCwd}" (source: ${input.base.source}) is not a git repository. Falling back to project_primary for this run.`,
+      ],
+      created: false,
+    };
+  }
+
   const repoRoot = await resolveGitOwnerRepoRoot(input.base.baseCwd);
   const branchTemplate = asString(rawStrategy.branchTemplate, "{{issue.identifier}}-{{slug}}");
   const renderedBranch = renderWorkspaceTemplate(branchTemplate, {
