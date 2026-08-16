@@ -385,12 +385,33 @@ function renderWorkspaceTemplate(template: string, input: {
   projectId: string | null;
   repoRef: string | null;
 }) {
-  const issueIdentifier = input.issue?.identifier ?? input.issue?.id ?? "issue";
-  const slug = sanitizeSlugPart(input.issue?.title, sanitizeSlugPart(issueIdentifier, "issue"));
+  // A run with no issue context (a manual/context-less agent wake, or an
+  // issue with neither an identifier nor a usable id) has nothing to key a
+  // branch name on. The old fallback rendered the fixed literal "issue" for
+  // `{{slug}}`, while the raw `{{issue.identifier}}` template var had NO
+  // fallback at all and rendered as an empty string. A project-configured
+  // template like "paperclip/{{issue.identifier}}-{{slug}}" therefore
+  // rendered the exact same "paperclip/-issue" branch/worktree path for
+  // *every* context-less run, so unrelated runs silently shared (and
+  // corrupted) one worktree. See incident: worktree created at
+  // .paperclip/worktrees/paperclip/-issue, later found checked out to an
+  // unrelated branch ("USE-193-content-only") by a different agent's run.
+  //
+  // Fix: derive a single non-empty, per-render fallback identifier and use
+  // it consistently everywhere an identifier is exposed to the template, so
+  // a missing/empty issue never collapses to a name shared across runs. If a
+  // real identifier exists but sanitizes away to nothing (e.g. an
+  // emoji/symbol-only title with a symbol-only identifier), fall back to a
+  // fresh unique slug rather than reintroducing unsanitized text.
+  const uniqueFallbackSlug = () => `no-issue-${randomUUID().slice(0, 8)}`;
+  const realIdentifier = (input.issue?.identifier?.trim() || input.issue?.id?.trim() || "");
+  const identifierForTemplate = realIdentifier || uniqueFallbackSlug();
+  const slugFallback = sanitizeSlugPart(identifierForTemplate, uniqueFallbackSlug());
+  const slug = sanitizeSlugPart(input.issue?.title, slugFallback);
   return renderTemplate(template, {
     issue: {
       id: input.issue?.id ?? "",
-      identifier: input.issue?.identifier ?? "",
+      identifier: input.issue?.identifier ?? identifierForTemplate,
       title: input.issue?.title ?? "",
     },
     agent: {
@@ -408,12 +429,18 @@ function renderWorkspaceTemplate(template: string, input: {
 }
 
 function sanitizeBranchName(value: string): string {
-  return value
+  const sanitized = value
     .trim()
     .replace(/[^A-Za-z0-9._/-]+/g, "-")
     .replace(/-+/g, "-")
+    // Collapse doubled/empty path segments (e.g. a template variable that
+    // rendered empty leaving "prefix//slug") — an empty segment is still a
+    // valid-looking git ref, so it silently produces a shared/colliding
+    // branch name rather than an obviously broken one.
+    .replace(/\/+/g, "/")
     .replace(/^[-/.]+|[-/.]+$/g, "")
-    .slice(0, 120) || "paperclip-work";
+    .slice(0, 120);
+  return sanitized || "paperclip-work";
 }
 
 function isAbsolutePath(value: string) {
