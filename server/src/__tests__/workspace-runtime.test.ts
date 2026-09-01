@@ -741,6 +741,118 @@ describe("realizeExecutionWorkspace", () => {
     expect(realized.warnings.some((w) => /git_worktree/i.test(w))).toBe(true);
   });
 
+  it("never renders a shared/colliding branch name for a context-less run, even when the template references issue.identifier directly (regression: worktree at .paperclip/worktrees/paperclip/-issue)", async () => {
+    const repoRoot = await createTempRepo();
+
+    const realizeContextLess = () =>
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "paperclip/{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: null,
+        agent: {
+          id: "agent-1",
+          name: "QA Release Owner",
+          companyId: "company-1",
+        },
+      });
+
+    const first = await realizeContextLess();
+    const second = await realizeContextLess();
+
+    expect(first.branchName).not.toBe("paperclip/-issue");
+    expect(first.branchName).not.toMatch(/^paperclip\/-/);
+    expect(first.worktreePath).not.toBe(path.join(repoRoot, ".paperclip", "worktrees", "paperclip", "-issue"));
+
+    // Two independent context-less runs must never collapse onto the same
+    // branch/worktree — that collision is exactly what corrupted the shared
+    // worktree in production.
+    expect(second.branchName).not.toBe(first.branchName);
+  });
+
+  it("falls back to the sanitized identifier when the issue title is emoji/symbol-only", async () => {
+    const repoRoot = await createTempRepo();
+
+    const realized = await realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: {
+        workspaceStrategy: {
+          type: "git_worktree",
+          branchTemplate: "{{issue.identifier}}-{{slug}}",
+        },
+      },
+      issue: {
+        id: "issue-1",
+        identifier: "PAP-9",
+        title: "🎉✨💥",
+      },
+      agent: {
+        id: "agent-1",
+        name: "Codex Coder",
+        companyId: "company-1",
+      },
+    });
+
+    expect(realized.branchName).toBe("PAP-9-pap-9");
+  });
+
+  it("falls back to a unique safe slug (not garbage) when both the identifier and title sanitize away to nothing", async () => {
+    const repoRoot = await createTempRepo();
+
+    const realizeWithGarbageIssue = () =>
+      realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "@@@",
+          title: "!!!",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+      });
+
+    const first = await realizeWithGarbageIssue();
+
+    expect(first.branchName).not.toBeNull();
+    expect(first.branchName).not.toMatch(/[^A-Za-z0-9._/-]/);
+    expect(first.branchName).not.toBe("");
+    expect(first.branchName).toMatch(/no-issue-[0-9a-f]{8}$/);
+  });
+
   it("rejects reusing an empty directory that only looks like a worktree because it sits inside the repo", async () => {
     const repoRoot = await createTempRepo();
     const branchName = "PAP-447-add-worktree-support";
